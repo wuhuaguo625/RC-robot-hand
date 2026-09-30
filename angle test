@@ -1,0 +1,265 @@
+/*
+ * ============================================================================
+ *  angle_test —— 找机械臂各关节的机械极限
+ *  Arduino UNO R3 + pi ArmJoystick U3.0 扩展板
+ * ============================================================================
+ *
+ *  用途：给某个关节指定一个角度，它慢慢转过去。你看着机械臂，
+ *        一点点逼近极限，找到"再过去就要顶死"的那个角度。
+ *
+ *  ★ 换了舵机 / 舵机臂重新对齿 / 拆装过机械臂之后，必须重新测一遍极限，
+ *    因为舵机臂的安装角度变了，原来的角度值就全都不对了。
+ *
+ * ---------------------------------------------------------------------------
+ *  指令（波特率 115200，行尾必须选「换行符」）
+ * ---------------------------------------------------------------------------
+ *    b<角度>    底座转到指定角度     例：b45    b90    b170
+ *    r<角度>    大臂
+ *    f<角度>    小臂
+ *    c<角度>    爪子
+ *
+ *    ?          打印四个关节当前角度
+ *    V30        设定转动速度（度/秒），默认 30
+ *    E          使能全部舵机（机械臂变硬，保持住）
+ *    D          松开全部舵机（机械臂变软，可以用手掰）
+ *    h          帮助
+ *
+ *  角度范围 0-180，程序不做任何限制 —— 所以它能转到顶死。
+ *
+ * ---------------------------------------------------------------------------
+ *  怎么找极限（重要）
+ * ---------------------------------------------------------------------------
+ *    1. 先敲 D 让机械臂变软，用手把它摆到一个安全的起始位置
+ *    2. 敲 ? 看看四个关节当前的角度值
+ *    3. 一次只动一个关节，比如从当前值开始，每次加 10 度：
+ *          r90  ->  r100  ->  r110  ->  ...
+ *    4. 转到某个角度时如果机械臂不动了、或者听到嗡嗡响，
+ *       说明那个角度已经是极限了，退回上一个安全值
+ *    5. 把四个关节的上下极限都记下来
+ *
+ *  ⚠️ 速度默认 30 度/秒，比正常慢。速度慢才来得及松手。
+ *  ⚠️ 听到嗡嗡响 = 顶死了，立刻敲 D 松开，或者敲反向的角度退回来。
+ *     顶久了会烧舵机。
+ * ============================================================================
+ */
+
+#include <Servo.h>
+
+// ---- 关节：顺序和扩展板丝印 b / r / f / c 一致 ----
+enum { J_B = 0, J_R, J_F, J_C, J_N };
+
+const uint8_t PIN_SERVO[J_N] = { 9, 8, 7, 6 };      // 底座 大臂 小臂 爪子
+const char    JOINT_CH[J_N]  = { 'b', 'r', 'f', 'c' };
+const char*   JOINT_NAME[J_N] = { "底座(b)", "大臂(r)", "小臂(f)", "爪子(c)" };
+
+// 舵机自身能到的范围。这就是"不限制"，因为舵机本来就只能到 0-180。
+const float ANG_MIN = 0.0;
+const float ANG_MAX = 180.0;
+
+Servo servo[J_N];
+
+float cur[J_N]         = { 90, 90, 90, 90 };
+float target[J_N]      = { 90, 90, 90, 90 };
+float lastWritten[J_N] = { -999, -999, -999, -999 };
+bool  attached[J_N]    = { false, false, false, false };
+
+float speedDps = 30.0;
+const uint16_t TICK_MS = 20;
+unsigned long lastTick = 0;
+
+char    lineBuf[24];
+uint8_t lineLen = 0;
+
+float clampf(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+int8_t jointOf(char c) {
+  for (uint8_t i = 0; i < J_N; i++) {
+    if (JOINT_CH[i] == tolower((unsigned char)c)) return (int8_t)i;
+  }
+  return -1;
+}
+
+void enableJoint(uint8_t j) {
+  if (attached[j]) return;
+  servo[j].attach(PIN_SERVO[j]);
+  attached[j] = true;
+  Serial.print(F("  ["));
+  Serial.print(JOINT_NAME[j]);
+  Serial.println(F("] 已使能（舵机接管，会直接转到目标角度）"));
+}
+
+void printAngles() {
+  Serial.print(F("  当前角度: "));
+  for (uint8_t i = 0; i < J_N; i++) {
+    Serial.print(JOINT_NAME[i]);
+    Serial.print('=');
+    Serial.print(cur[i], 0);
+    Serial.print(F("  "));
+  }
+  Serial.println();
+}
+
+void printHelp() {
+  Serial.println(F("----------------------------------------------"));
+  Serial.println(F("  b<角度>  r<角度>  f<角度>  c<角度>"));
+  Serial.println(F("      例: b45   r120   c90    范围 0-180"));
+  Serial.println(F("  ?   看当前角度        V30  设定速度(度/秒)"));
+  Serial.println(F("  E   全部使能          D    全部松开变软"));
+  Serial.println(F("  h   帮助"));
+  Serial.println(F("----------------------------------------------"));
+}
+
+void detachAll() {
+  for (uint8_t i = 0; i < J_N; i++) {
+    if (attached[i]) {
+      servo[i].detach();
+      attached[i] = false;
+    }
+  }
+  Serial.println(F("  全部松开，机械臂变软，可以用手掰"));
+}
+
+void enableAll() {
+  for (uint8_t i = 0; i < J_N; i++) {
+    enableJoint(i);
+    target[i] = cur[i];          // 原地使能，不突然跳
+  }
+  Serial.println(F("  全部已使能"));
+  printAngles();
+}
+
+void setAngle(uint8_t j, float a) {
+  if (a < ANG_MIN || a > ANG_MAX) {
+    Serial.print(F("  WARN 角度要在 0-180 之间，已夹到 "));
+    Serial.println(clampf(a, ANG_MIN, ANG_MAX), 0);
+  }
+  a = clampf(a, ANG_MIN, ANG_MAX);
+
+  enableJoint(j);
+  target[j] = a;
+
+  Serial.print(F("  "));
+  Serial.print(JOINT_NAME[j]);
+  Serial.print(F(" -> "));
+  Serial.print(a, 0);
+  Serial.print(F(" 度  (当前 "));
+  Serial.print(cur[j], 0);
+  Serial.println(F(")"));
+}
+
+void processLine(char* s) {
+  while (*s == ' ' || *s == '\t') s++;
+  size_t n = strlen(s);
+  while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = '\0';
+  if (n == 0) return;
+
+  char c = tolower((unsigned char)s[0]);
+
+  // 单字符指令
+  if (n == 1) {
+    if (c == 'h') { printHelp();   return; }
+    if (c == '?') { printAngles(); return; }
+    if (c == 'd') { detachAll();   return; }
+    if (c == 'e') { enableAll();   return; }
+  }
+
+  // V<速度>
+  if (c == 'v') {
+    float v = atof(s + 1);
+    if (v < 3 || v > 120) {
+      Serial.println(F("  速度请给 3~120 之间，例：V30"));
+    } else {
+      speedDps = v;
+      Serial.print(F("  速度 = "));
+      Serial.print(speedDps, 0);
+      Serial.println(F(" 度/秒"));
+    }
+    return;
+  }
+
+  // <关节字母><角度>
+  int8_t j = jointOf(c);
+  if (j < 0) {
+    Serial.print(F("  看不懂: "));
+    Serial.println(s);
+    Serial.println(F("  发 h 看帮助（注意用英文输入法）"));
+    return;
+  }
+
+  char* p = s + 1;
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p == '\0') {
+    Serial.print(F("  缺少角度，例："));
+    Serial.print(JOINT_CH[j]);
+    Serial.println(F("45"));
+    return;
+  }
+
+  setAngle(j, atof(p));
+}
+
+void handleSerial() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      lineBuf[lineLen] = '\0';
+      if (lineLen > 0) processLine(lineBuf);
+      lineLen = 0;
+    } else if (lineLen < sizeof(lineBuf) - 1) {
+      lineBuf[lineLen++] = c;
+    }
+  }
+}
+
+void updateServos(float dt) {
+  float maxStep = speedDps * dt;
+
+  for (uint8_t i = 0; i < J_N; i++) {
+    if (!attached[i]) continue;
+
+    float d = target[i] - cur[i];
+    if (fabs(d) <= maxStep) cur[i] = target[i];
+    else                    cur[i] += (d > 0 ? maxStep : -maxStep);
+
+    if (fabs(cur[i] - lastWritten[i]) >= 0.4f) {
+      servo[i].write((int)(cur[i] + 0.5f));
+      lastWritten[i] = cur[i];
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // 上电不 attach 任何舵机 —— 机械臂是松的，不会一上电就动
+  for (uint8_t i = 0; i < J_N; i++) {
+    cur[i] = target[i] = 90;
+  }
+
+  Serial.println();
+  Serial.println(F("=============================================="));
+  Serial.println(F("  angle_test —— 找机械极限"));
+  Serial.println(F("  上电状态：舵机全部未使能，机械臂是松的"));
+  Serial.println(F("  敲 b/r/f/c + 角度 来转动对应关节"));
+  Serial.println(F("=============================================="));
+  printHelp();
+
+  lastTick = millis();
+}
+
+void loop() {
+  handleSerial();
+
+  unsigned long now = millis();
+  unsigned long dtMs = now - lastTick;
+  if (dtMs < TICK_MS) return;
+  lastTick = now;
+
+  updateServos(dtMs / 1000.0f);
+}
