@@ -30,9 +30,9 @@ const int CLAW_PIN = 6;
 
 // 按照你目前的接线
 const int JOY_BASE = A0;
-const int JOY_RARM = A3;
+const int JOY_RARM = A1;
 const int JOY_FARM = A2;
-const int JOY_CLAW = A1;
+const int JOY_CLAW = A3;
 
 
 // ============================================================
@@ -44,11 +44,11 @@ const int BASE_MIN = 0;
 const int BASE_MAX = 180;
 
 // 大臂 r
-const int RARM_MIN = 45;
-const int RARM_MAX = 105;
+const int RARM_MIN = 10;
+const int RARM_MAX = 170;
 
 // 小臂 f
-const int FARM_MIN = 60;
+const int FARM_MIN = 20;
 const int FARM_MAX = 150;
 
 // 爪子 c
