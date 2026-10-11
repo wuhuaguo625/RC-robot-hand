@@ -52,8 +52,8 @@ const int FARM_MIN = 20;
 const int FARM_MAX = 150;
 
 // 爪子 c
-const int CLAW_MIN = 0;
-const int CLAW_MAX = 110;
+const int CLAW_MIN = 50;
+const int CLAW_MAX = 120;
 
 
 // ============================================================
