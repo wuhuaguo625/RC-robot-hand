@@ -1,0 +1,1590 @@
+#include <Servo.h>
+#include <avr/pgmspace.h>
+#include <ctype.h>
+#include <string.h>
+#include <stdlib.h>
+
+// Arduino 自动生成原型前需要知道这两个结构体名称。
+struct Pose;
+struct MotionFrame;
+
+
+// ============================================================
+//                1. 机械臂姿态结构体
+// ============================================================
+// B：底座
+// R：大臂
+// F：小臂
+// C：夹爪
+
+struct Pose {
+    // 角度只在0..180，使用单字节；20个旧姿态记录省下80字节。
+    uint8_t base;
+    uint8_t rArm;
+    uint8_t fArm;
+    uint8_t claw;
+};
+
+// ============================================================
+//                2. 舵机对象与引脚
+// ============================================================
+
+Servo base;
+Servo rArm;
+Servo fArm;
+Servo claw;
+
+const int BASE_PIN = 9;
+const int RARM_PIN = 8;
+const int FARM_PIN = 7;
+const int CLAW_PIN = 6;
+
+// ============================================================
+//                3. 摇杆引脚
+// ============================================================
+
+const int JOY_BASE = A0;
+const int JOY_RARM = A1;
+const int JOY_FARM = A2;
+const int JOY_CLAW = A3;
+
+// ============================================================
+//                4. 舵机角度限位
+// ============================================================
+
+const int BASE_MIN = 0;
+const int BASE_MAX = 180;
+
+const int RARM_MIN = 10;
+const int RARM_MAX = 170;
+
+const int FARM_MIN = 20;
+const int FARM_MAX = 150;
+
+const int CLAW_MIN = 50;
+const int CLAW_MAX = 120;
+
+// ============================================================
+//                5. 当前角度与目标角度
+// ============================================================
+
+// 上电初始角度全部为90度
+
+int baseAngle = 90;
+int rArmAngle = 90;
+int fArmAngle = 90;
+int clawAngle = 90;
+
+// 自动控制时的目标角度
+
+int baseTarget = 90;
+int rArmTarget = 90;
+int fArmTarget = 90;
+int clawTarget = 90;
+
+bool autoMoving = false;
+
+// ============================================================
+//                6. 摇杆中心与死区
+// ============================================================
+
+// 按之前实测的数据设置
+
+const int JOY_BASE_CENTER = 511;
+const int JOY_RARM_CENTER = 517;
+const int JOY_FARM_CENTER = 526;
+const int JOY_CLAW_CENTER = 523;
+
+const int DEAD_ZONE = 130;
+
+// ============================================================
+//                7. 运动速度
+// ============================================================
+
+// 每隔60ms调整1度
+// H：加快速度
+// L：降低速度
+
+int moveInterval = 60;
+
+const int FASTEST = 20;
+const int SLOWEST = 150;
+
+// 四个舵机独立计时
+
+unsigned long lastBaseMove = 0;
+unsigned long lastRArmMove = 0;
+unsigned long lastFArmMove = 0;
+unsigned long lastClawMove = 0;
+
+// ============================================================
+//                8. 手动姿态记录
+// ============================================================
+
+const int MAX_POSES = 20;
+
+Pose recordedPoses[MAX_POSES];
+
+int poseCount = 0;
+
+bool replaying = false;
+int replayIndex = 0;
+
+// ============================================================
+//                9. 任务二：硬币A
+// ============================================================
+// 基于原示教姿态同时微调A的R/F：R从107增到111，F从20降到16。
+// 下降量需实物校准；未标定舵机角与几何角，不能保证恰好下降0.5cm。
+// 夹持角保留当前120；几何方向和最终位置需实物验证。
+const uint8_t COIN_A_PICK_R = 111;
+const uint8_t COIN_A_PICK_F = 16;
+const uint8_t COIN_A_GRIP_C = 120;
+
+const Pose COIN_A_POSES[] PROGMEM = {
+
+    {85, 93, 31, 60},    // 0：来到硬币上方
+
+    {83, COIN_A_PICK_R, COIN_A_PICK_F, 60},   // 1：R/F一起调整，尝试向前、向下
+
+    {83, COIN_A_PICK_R, COIN_A_PICK_F, COIN_A_GRIP_C},  // 2：在新抓取点夹紧
+
+    {83, 107, 80, COIN_A_GRIP_C},  // 3：保持夹紧，提起硬币
+
+    {118, 107, 80, COIN_A_GRIP_C}, // 4：保持夹紧，旋转底座
+
+    {118, 107, 52, COIN_A_GRIP_C}, // 5：保持夹紧，下降到放置点
+
+    {118, 107, 52, 70},  // 6：松开硬币
+
+    {118, 63, 61, 70}    // 7：撤离
+};
+
+// ============================================================
+//                10. 任务二：笔B
+// ============================================================
+// 保留原抓取姿态；按用户要求将放置位置改为{74,61,34,50}。
+
+const Pose PEN_B_POSES[] PROGMEM = {
+
+    {125, 86, 34, 51},   // 0：到达笔上方
+
+    {125, 91, 34, 50},   // 1：下降抓笔
+
+    {125, 91, 34, 119},  // 2：夹住笔
+
+    {125, 91, 79, 119},  // 3：提起笔
+
+    {74, 61, 34, 119},   // 4：保持夹紧，转移到新的放置位置
+
+    {74, 61, 34, 50},    // 5：在新位置松开笔
+
+    {74, 61, 34, 50}     // 6：保持此姿态，与统一返回位置一致
+};
+
+// 任务二：第三个物体C，顺序为 {B底座, R大臂, F小臂, C夹爪}。
+// 用户实测的7组姿态，按原顺序执行，不改变角度。
+const Pose OBJECT_C_POSES[] PROGMEM = {
+    {55, 78, 61, 50},    // 0：移到物体上方
+    {56, 95, 38, 50},    // 1：下降到物体中部
+    {56, 102, 34, 112},  // 2：夹住物体
+    {56, 72, 34, 112},   // 3：提起物体
+    {50, 61, 34, 112},   // 4：转移物体
+    {50, 61, 34, 50},    // 5：松开物体
+    {74, 61, 34, 50}     // 6：转到安全位置
+};
+
+// 自动计算姿态数量
+
+const byte COIN_A_COUNT =
+    sizeof(COIN_A_POSES) / sizeof(COIN_A_POSES[0]);
+
+const byte PEN_B_COUNT =
+    sizeof(PEN_B_POSES) / sizeof(PEN_B_POSES[0]);
+
+const byte OBJECT_C_COUNT =
+    sizeof(OBJECT_C_POSES) / sizeof(OBJECT_C_POSES[0]);
+
+// ============================================================
+//                11. 自动任务状态
+// ============================================================
+
+// 0：没有执行任务
+// A：抓硬币
+// B：抓笔
+// C：抓第三个物体
+
+char activeTask = 0;
+
+// 当前正在执行的姿态数组
+
+const Pose *activePoses = NULL;
+
+// 当前任务的姿态总数
+
+byte activePoseCount = 0;
+
+// 当前执行到第几个姿态
+
+byte activeStep = 0;
+
+// 是否正在等待当前姿态稳定
+
+bool activeStepWaiting = false;
+
+unsigned long activeWaitStart = 0;
+
+// A/B/C完成原抓取序列后，统一返回此姿态，再发送DONE回执。
+const Pose TASK_RETURN_POSE = {74, 61, 34, 50};
+bool taskReturning = false;
+
+// ============================================================
+//       12. 新增：笔B先转向，再伸臂的状态
+// ============================================================
+
+// true：正在执行笔B的预先转向阶段
+
+bool penTurnFirst = false;
+
+// true：底座已完成角度移动，正在等待稳定
+
+bool penTurnSettling = false;
+
+// 开始等待的时间
+
+unsigned long penTurnSettledAt = 0;
+
+// 底座转到位后额外等待300ms
+
+const unsigned long PEN_TURN_WAIT = 300;
+
+// ============================================================
+//                13. 初始化
+// ============================================================
+
+
+// ============================================================
+// 任务三：统一控制权与固定内存录制缓冲区
+// ============================================================
+enum SystemMode : uint8_t {
+    MODE_IDLE, MODE_AUTO_TASK, MODE_RECORDING,
+    MODE_PLAY_PREPARE, MODE_PLAYBACK, MODE_HOME,
+    MODE_POSE_REPLAY, MODE_DIRECT
+};
+SystemMode mode = MODE_IDLE;
+
+struct MotionFrame {
+    uint8_t base, rArm, fArm, claw;
+};
+const uint16_t RECORD_INTERVAL = 100;   // 毫秒，每秒10帧
+const uint8_t MAX_FRAMES = 128;         // 含t=0，最长12.7秒
+const uint16_t MIN_RECORD_MS = 10000;   // 必须严格大于10秒
+const uint8_t MOTION_THRESHOLD = 5;     // 辅助检查，非官方评分阈值
+// 两块512字节缓冲区：新录制失败时不破坏旧的有效录制。
+MotionFrame motionBuffers[2][MAX_FRAMES];
+uint8_t savedBuffer = 0, workBuffer = 1;
+uint8_t savedCount = 0, recordingCount = 0, playbackIndex = 0;
+bool savedValid = false;
+uint16_t savedDuration = 0;
+unsigned long recordStartedAt = 0, playbackStartedAt = 0;
+MotionFrame recordingMin, recordingMax;
+unsigned long playbackSettleAt = 0;
+bool playbackSettling = false;
+const uint16_t PLAY_PREPARE_WAIT = 300;
+
+Pose readTaskPose(byte index) {
+    Pose result;
+    memcpy_P(&result, activePoses + index, sizeof(result));
+    return result;
+}
+
+void setup() {
+
+    Serial.begin(9600);
+
+    // 初始化舵机
+
+    base.attach(BASE_PIN);
+    rArm.attach(RARM_PIN);
+    fArm.attach(FARM_PIN);
+    claw.attach(CLAW_PIN);
+
+    // 设置初始角度
+
+    base.write(baseAngle);
+    delay(100);
+
+    rArm.write(rArmAngle);
+    delay(100);
+
+    fArm.write(fArmAngle);
+    delay(100);
+
+    claw.write(clawAngle);
+    delay(100);
+
+    Serial.println(F("========================"));
+    Serial.println(F("MeArm Task 1/2/3 Ready - 9600 8N1"));
+    Serial.println(F("REC / STOP / PLAY / HOME / X / ?"));
+    Serial.println(F("Record: >10s, max12.7s; RAM only"));
+    Serial.println(F("========================"));
+
+    Serial.println(F("A = Coin"));
+    Serial.println(F("B = Pen (Turn First)"));
+    Serial.println(F("C = Object C"));
+
+    Serial.println(F("X = Stop"));
+    Serial.println(F("HOME = All 90"));
+
+    Serial.println(F("O = Open Claw"));
+    Serial.println(F("S = Close Claw"));
+
+    Serial.println(F("H = Faster"));
+    Serial.println(F("L = Slower"));
+
+    Serial.println(F("R = Record Pose"));
+    Serial.println(F("P = Print Poses"));
+    Serial.println(F("E = Replay Poses"));
+
+    Serial.println(F("x120,y80,z100"));
+    Serial.println(F("========================"));
+}
+
+// ============================================================
+//                14. 设置目标姿态
+// ============================================================
+
+// 这个函数只是设置目标角度
+// 真正的逐步运动由updateAutoMovement完成
+
+void moveToPose(Pose target) {
+
+    // A的微调超出原软件范围，仅对A自动序列启用对应边界。
+    const bool coinATask = (mode == MODE_AUTO_TASK && activeTask == 'A');
+    const int fMin = coinATask ? min(FARM_MIN, (int)COIN_A_PICK_F) : FARM_MIN;
+    const int cMax = coinATask ? max(CLAW_MAX, (int)COIN_A_GRIP_C) : CLAW_MAX;
+
+    baseTarget = constrain(
+        target.base,
+        BASE_MIN,
+        BASE_MAX
+    );
+
+    rArmTarget = constrain(
+        target.rArm,
+        RARM_MIN,
+        RARM_MAX
+    );
+
+    fArmTarget = constrain(
+        target.fArm,
+        fMin,
+        FARM_MAX
+    );
+
+    clawTarget = constrain(
+        target.claw,
+        CLAW_MIN,
+        cMax
+    );
+
+    autoMoving = true;
+}
+
+// ============================================================
+//                15. 判断是否到达姿态
+// ============================================================
+
+bool poseReached(Pose target) {
+
+    return (
+        baseAngle == target.base &&
+        rArmAngle == target.rArm &&
+        fArmAngle == target.fArm &&
+        clawAngle == target.claw
+    );
+}
+
+// ============================================================
+//                16. 自动移动单个舵机
+// ============================================================
+
+// 每隔moveInterval毫秒改变1度
+// 不使用delay阻塞主循环
+
+void moveServoToTarget(
+    int &currentAngle,
+    int targetAngle,
+    Servo &servo,
+    unsigned long &lastMove
+) {
+
+    unsigned long now = millis();
+
+    // 尚未达到下一次运动时间
+
+    if (now - lastMove < (unsigned long)moveInterval) {
+        return;
+    }
+
+    // 已经到达目标
+
+    if (currentAngle == targetAngle) {
+        return;
+    }
+
+    // 逐度接近目标
+
+    if (currentAngle < targetAngle) {
+        currentAngle++;
+    }
+    else {
+        currentAngle--;
+    }
+
+    servo.write(currentAngle);
+
+    lastMove = now;
+}
+
+// ============================================================
+//                17. 更新自动运动
+// ============================================================
+
+void updateAutoMovement() {
+
+    if (!autoMoving) {
+        return;
+    }
+
+    // 四个舵机独立移动
+
+    moveServoToTarget(
+        baseAngle,
+        baseTarget,
+        base,
+        lastBaseMove
+    );
+
+    moveServoToTarget(
+        rArmAngle,
+        rArmTarget,
+        rArm,
+        lastRArmMove
+    );
+
+    moveServoToTarget(
+        fArmAngle,
+        fArmTarget,
+        fArm,
+        lastFArmMove
+    );
+
+    moveServoToTarget(
+        clawAngle,
+        clawTarget,
+        claw,
+        lastClawMove
+    );
+
+    // 四个关节全部达到目标
+
+    if (
+        baseAngle == baseTarget &&
+        rArmAngle == rArmTarget &&
+        fArmAngle == fArmTarget &&
+        clawAngle == clawTarget
+    ) {
+
+        autoMoving = false;
+    }
+}
+
+// ============================================================
+//                18. 判断自动任务是否在运行
+// ============================================================
+
+bool taskRunning() {
+    return activeTask != 0;
+}
+
+// ============================================================
+//                19. 不同姿态的等待时间
+// ============================================================
+
+unsigned int taskWaitMs(char task, byte step) {
+
+    // A/B/C都是第2个姿态夹紧物体，等待800ms稳定夹持
+
+    if (step == 2) {
+        return 800;
+    }
+
+    // 硬币第6个姿态松开
+
+    if (task == 'A' && step == 6) {
+        return 700;
+    }
+
+    // 笔B和物体C都在第5个姿态松开，等待700ms
+
+    if ((task == 'B' || task == 'C') && step == 5) {
+        return 700;
+    }
+
+    // 普通姿态等待100ms
+    // 避免动作之间明显卡顿
+
+    return 100;
+}
+
+// ============================================================
+//                20. 中止自动抓取任务
+// ============================================================
+
+void cancelTask() {
+
+    if (!taskRunning()) {
+        return;
+    }
+
+    char cancelledTask = activeTask;
+    taskReturning = false;
+    mode = MODE_IDLE;
+
+    activeTask = 0;
+
+    activePoses = NULL;
+
+    activePoseCount = 0;
+
+    activeStepWaiting = false;
+
+    // 清除笔B的预先转向状态
+
+    penTurnFirst = false;
+
+    penTurnSettling = false;
+
+    // 停止自动运动
+
+    autoMoving = false;
+
+    // 将目标角度同步为当前角度
+    // 防止取消以后继续运动
+
+    baseTarget = baseAngle;
+    rArmTarget = rArmAngle;
+    fArmTarget = fArmAngle;
+    clawTarget = clawAngle;
+
+    Serial.print(F("Task Cancelled: "));
+    Serial.println(cancelledTask);
+}
+
+// ============================================================
+//                21. 开始任务A、B或C
+// ============================================================
+
+void startTask(char task) {
+
+    if (taskRunning()) {
+
+        Serial.println(F("Task Busy"));
+        return;
+    }
+
+    // 选择姿态数组
+
+    if (task == 'A') {
+
+        activePoses = COIN_A_POSES;
+
+        activePoseCount = COIN_A_COUNT;
+    }
+
+    else if (task == 'B') {
+
+        activePoses = PEN_B_POSES;
+
+        activePoseCount = PEN_B_COUNT;
+    }
+
+    else if (task == 'C') {
+
+        activePoses = OBJECT_C_POSES;
+
+        activePoseCount = OBJECT_C_COUNT;
+    }
+
+    else {
+
+        Serial.println(F("Unknown Task"));
+        return;
+    }
+
+    // 取消原来的手动姿态回放
+
+    replaying = false;
+
+    // 初始化任务
+
+    activeTask = task;
+    taskReturning = false;
+    mode = MODE_AUTO_TASK;
+
+    activeStep = 0;
+
+    activeStepWaiting = false;
+
+    penTurnFirst = false;
+
+    penTurnSettling = false;
+
+    Serial.print(F("Start Task: "));
+    Serial.println(activeTask);
+
+    // ====================================================
+    // 关键修改：笔B先转向，再向前伸
+    // ====================================================
+
+    if (task == 'B') {
+
+        // 开启预先转向阶段
+
+        penTurnFirst = true;
+
+        // 只修改底座角度
+        // 大臂、小臂、夹爪保持当前位置不动
+
+        Pose turnOnly = {
+
+            125,        // 底座先转到125度
+
+            (uint8_t)rArmAngle,  // 大臂保持当前角度
+
+            (uint8_t)fArmAngle,  // 小臂保持当前角度
+
+            (uint8_t)clawAngle   // 夹爪保持当前角度
+        };
+
+        moveToPose(turnOnly);
+
+        Serial.println(F("B: Turning Base First"));
+    }
+
+    // ====================================================
+    // 硬币A与物体C直接从各自的第0组姿态开始
+    // ====================================================
+
+    else {
+
+        moveToPose(readTaskPose(0));
+    }
+}
+
+// ============================================================
+//                22. 自动任务执行状态机
+// ============================================================
+
+// 不断检测当前动作是否完成
+// 到位后等待，再执行下一个姿态
+
+void updateTask() {
+
+    if (!taskRunning()) {
+        return;
+    }
+
+    // 返回阶段也属于当前任务，尚未返回到位时保持BUSY。
+    if (taskReturning) {
+        if (autoMoving || !poseReached(TASK_RETURN_POSE)) return;
+        Serial.print(F("DONE:"));
+        Serial.println(activeTask);
+        mode = MODE_IDLE;
+        activeTask = 0;
+        activePoses = NULL;
+        activePoseCount = 0;
+        activeStepWaiting = false;
+        penTurnFirst = false;
+        penTurnSettling = false;
+        taskReturning = false;
+        return;
+    }
+
+    // ====================================================
+    // 笔B的特殊阶段：先转向
+    // ====================================================
+
+    if (activeTask == 'B' && penTurnFirst) {
+
+        // 底座还在移动
+        // 或者还没有到达125度
+
+        if (
+            autoMoving ||
+            baseAngle != 125
+        ) {
+            return;
+        }
+
+        // 到达目标角度后，开始计时
+
+        if (!penTurnSettling) {
+
+            penTurnSettling = true;
+
+            penTurnSettledAt = millis();
+
+            Serial.println(F("B: Base Turn Finished"));
+
+            return;
+        }
+
+        // 等待300ms，让实体舵机稳定
+
+        if (
+            millis() - penTurnSettledAt <
+            PEN_TURN_WAIT
+        ) {
+            return;
+        }
+
+        // 转向阶段结束
+
+        penTurnFirst = false;
+
+        penTurnSettling = false;
+
+        Serial.println(F("B: Moving Arm Forward"));
+
+        // 现在才开始移动大臂、小臂、夹爪
+        // 进入笔B的姿态0
+
+        moveToPose(readTaskPose(0));
+
+        return;
+    }
+
+    // ====================================================
+    // 正常执行A/B/C的姿态序列
+    // ====================================================
+
+    // 当前还没有进入等待阶段
+
+    if (!activeStepWaiting) {
+
+        // 机械臂还在运动
+
+        if (autoMoving) {
+            return;
+        }
+
+        // 检查角度是否到位
+
+        if (!poseReached(readTaskPose(activeStep))) {
+            return;
+        }
+
+        // 已经到达当前姿态
+
+        activeStepWaiting = true;
+
+        activeWaitStart = millis();
+
+        Serial.print(F("Task "));
+        Serial.print(activeTask);
+
+        Serial.print(F(" Pose "));
+        Serial.println(activeStep);
+
+        return;
+    }
+
+    // ====================================================
+    // 等待当前姿态稳定
+    // ====================================================
+
+    if (
+        millis() - activeWaitStart <
+        taskWaitMs(activeTask, activeStep)
+    ) {
+        return;
+    }
+
+    // ====================================================
+    // 进入下一个姿态
+    // ====================================================
+
+    activeStep++;
+
+    // 判断任务是否全部完成
+
+    if (activeStep >= activePoseCount) {
+        taskReturning = true;
+        moveToPose(TASK_RETURN_POSE);
+        Serial.println(F("Returning:74,61,34,50"));
+        return;
+    }
+
+    // 准备执行下一步
+
+    activeStepWaiting = false;
+
+    moveToPose(readTaskPose(activeStep));
+}
+
+// ============================================================
+//                23. HOME回中
+// ============================================================
+
+// 四个舵机全部回到90度
+
+void moveHome() {
+    stopAllMovement();  // 未完成录制丢弃，保留上次有效录制
+    mode = MODE_HOME;
+    Pose home = {90, 90, 90, 90};
+    moveToPose(home);
+    Serial.println(F("ACK:HOME"));
+}
+
+// ============================================================
+//                24. 摇杆主方向判断
+// ============================================================
+
+// 同一个摇杆的两个轴
+// 哪个偏离中心更多，就响应哪个
+//
+// 0：不动作
+// 1：X方向
+// 2：Y方向
+
+int getMainDirection(
+    int xValue,
+    int yValue,
+    int xCenter,
+    int yCenter
+) {
+
+    int dx = abs(xValue - xCenter);
+
+    int dy = abs(yValue - yCenter);
+
+    bool xActive = dx > DEAD_ZONE;
+
+    bool yActive = dy > DEAD_ZONE;
+
+    if (!xActive && !yActive) {
+        return 0;
+    }
+
+    if (xActive && !yActive) {
+        return 1;
+    }
+
+    if (!xActive && yActive) {
+        return 2;
+    }
+
+    // 两个方向都超过死区
+    // 只响应偏移较大的方向
+
+    if (dx > dy) {
+        return 1;
+    }
+
+    if (dy > dx) {
+        return 2;
+    }
+
+    return 0;
+}
+
+// ============================================================
+//                25. 摇杆控制单个舵机
+// ============================================================
+
+void controlJoystickServo(
+    int joystickValue,
+    int &servoAngle,
+    Servo &servo,
+    int minAngle,
+    int maxAngle,
+    unsigned long &lastMove,
+    bool reverseDirection,
+    int joystickCenter
+) {
+
+    unsigned long now = millis();
+
+    // 控制运动速度
+
+    if (
+        now - lastMove <
+        (unsigned long)moveInterval
+    ) {
+        return;
+    }
+
+    int difference = joystickValue - joystickCenter;
+
+    // 死区内不动作
+
+    if (abs(difference) <= DEAD_ZONE) {
+        return;
+    }
+
+    // 正方向
+
+    if (difference > 0) {
+
+        if (reverseDirection) {
+            servoAngle--;
+        }
+        else {
+            servoAngle++;
+        }
+    }
+
+    // 反方向
+
+    else {
+
+        if (reverseDirection) {
+            servoAngle++;
+        }
+        else {
+            servoAngle--;
+        }
+    }
+
+    // 角度限位
+
+    servoAngle = constrain(
+        servoAngle,
+        minAngle,
+        maxAngle
+    );
+
+    // 输出舵机
+
+    servo.write(servoAngle);
+
+    lastMove = now;
+}
+
+// ============================================================
+//                26. 摇杆控制主函数
+// ============================================================
+
+void joystickControl() {
+    // 回放和回中独占舵机；录制允许原来的摇杆逻辑运行。
+    if (mode == MODE_PLAY_PREPARE || mode == MODE_PLAYBACK || mode == MODE_HOME) return;
+
+    // 读取四个摇杆
+
+    int baseJoy = analogRead(JOY_BASE);
+
+    int rArmJoy = analogRead(JOY_RARM);
+
+    int fArmJoy = analogRead(JOY_FARM);
+
+    int clawJoy = analogRead(JOY_CLAW);
+
+    // 左摇杆主方向
+
+    int leftDirection = getMainDirection(
+        baseJoy,
+        rArmJoy,
+        JOY_BASE_CENTER,
+        JOY_RARM_CENTER
+    );
+
+    // 右摇杆主方向
+
+    int rightDirection = getMainDirection(
+        fArmJoy,
+        clawJoy,
+        JOY_FARM_CENTER,
+        JOY_CLAW_CENTER
+    );
+
+    bool joystickMoving =
+        (leftDirection != 0) ||
+        (rightDirection != 0);
+
+    // ====================================================
+    // 人工摇杆优先
+    // ====================================================
+
+    if (joystickMoving) {
+        if (mode != MODE_RECORDING && mode != MODE_IDLE) stopAllMovement();
+
+        // 如果A/B任务正在执行，取消任务
+
+        cancelTask();
+
+        replaying = false;
+
+        autoMoving = false;
+
+        // 目标角度同步
+        // 防止摇杆松开以后舵机回弹
+
+        baseTarget = baseAngle;
+        rArmTarget = rArmAngle;
+        fArmTarget = fArmAngle;
+        clawTarget = clawAngle;
+    }
+
+    // ====================================================
+    // 左摇杆：底座与大臂
+    // ====================================================
+
+    // A0：底座，反向
+
+    if (leftDirection == 1) {
+
+        controlJoystickServo(
+            baseJoy,
+            baseAngle,
+            base,
+            BASE_MIN,
+            BASE_MAX,
+            lastBaseMove,
+            true,
+            JOY_BASE_CENTER
+        );
+    }
+
+    // A1：大臂，反向
+
+    else if (leftDirection == 2) {
+
+        controlJoystickServo(
+            rArmJoy,
+            rArmAngle,
+            rArm,
+            RARM_MIN,
+            RARM_MAX,
+            lastRArmMove,
+            true,
+            JOY_RARM_CENTER
+        );
+    }
+
+    // ====================================================
+    // 右摇杆：小臂与夹爪
+    // ====================================================
+
+    // A2：小臂，正向
+
+    if (rightDirection == 1) {
+
+        controlJoystickServo(
+            fArmJoy,
+            fArmAngle,
+            fArm,
+            FARM_MIN,
+            FARM_MAX,
+            lastFArmMove,
+            false,
+            JOY_FARM_CENTER
+        );
+    }
+
+    // A3：夹爪，正向
+
+    else if (rightDirection == 2) {
+
+        controlJoystickServo(
+            clawJoy,
+            clawAngle,
+            claw,
+            CLAW_MIN,
+            CLAW_MAX,
+            lastClawMove,
+            false,
+            JOY_CLAW_CENTER
+        );
+    }
+    if (joystickMoving) syncTargets();
+}
+
+// ============================================================
+//                27. 记录当前姿态
+// ============================================================
+
+void recordCurrentPose() {
+
+    if (poseCount >= MAX_POSES) {
+
+        Serial.println(F("Pose Memory Full"));
+        return;
+    }
+
+    recordedPoses[poseCount].base = baseAngle;
+
+    recordedPoses[poseCount].rArm = rArmAngle;
+
+    recordedPoses[poseCount].fArm = fArmAngle;
+
+    recordedPoses[poseCount].claw = clawAngle;
+
+    Serial.print(F("Record Pose "));
+    Serial.println(poseCount);
+
+    Serial.print(F("B="));
+    Serial.print(baseAngle);
+
+    Serial.print(F(" R="));
+    Serial.print(rArmAngle);
+
+    Serial.print(F(" F="));
+    Serial.print(fArmAngle);
+
+    Serial.print(F(" C="));
+    Serial.println(clawAngle);
+
+    poseCount++;
+}
+
+// ============================================================
+//                28. 显示手动记录的姿态
+// ============================================================
+
+void showRecordedPoses() {
+
+    Serial.println(F("===== Recorded Poses ====="));
+
+    if (poseCount == 0) {
+
+        Serial.println(F("No Recorded Poses"));
+        return;
+    }
+
+    for (int i = 0; i < poseCount; i++) {
+
+        Serial.print(F("Pose "));
+        Serial.print(i);
+
+        Serial.print(F(": B="));
+        Serial.print(recordedPoses[i].base);
+
+        Serial.print(F(" R="));
+        Serial.print(recordedPoses[i].rArm);
+
+        Serial.print(F(" F="));
+        Serial.print(recordedPoses[i].fArm);
+
+        Serial.print(F(" C="));
+        Serial.println(recordedPoses[i].claw);
+    }
+}
+
+// ============================================================
+//                29. 开始回放手动记录的姿态
+// ============================================================
+
+void startReplay() {
+
+    if (poseCount == 0) {
+
+        Serial.println(F("No Poses To Replay"));
+        return;
+    }
+
+    if (taskRunning()) {
+
+        Serial.println(F("Task Busy"));
+        return;
+    }
+
+    replaying = true;
+    mode = MODE_POSE_REPLAY;
+
+    replayIndex = 0;
+
+    moveToPose(recordedPoses[0]);
+
+    Serial.println(F("Start Replay"));
+}
+
+// ============================================================
+//                30. 更新手动姿态回放
+// ============================================================
+
+void updateReplay() {
+
+    if (!replaying) {
+        return;
+    }
+
+    // 当前姿态还没有到达
+
+    if (!poseReached(recordedPoses[replayIndex])) {
+        return;
+    }
+
+    // 到达后进入下一个姿态
+
+    replayIndex++;
+
+    // 全部回放结束
+
+    if (replayIndex >= poseCount) {
+
+        replaying = false;
+
+        mode = MODE_IDLE;
+        Serial.println(F("DONE:E"));
+
+        return;
+    }
+
+    moveToPose(recordedPoses[replayIndex]);
+}
+
+// ============================================================
+//                31. 打开夹爪
+// ============================================================
+
+void openClaw() {
+
+    clawTarget = CLAW_MIN;
+
+    autoMoving = true;
+
+    Serial.println(F("Open Claw"));
+}
+
+// ============================================================
+//                32. 关闭夹爪
+// ============================================================
+
+void closeClaw() {
+
+    clawTarget = CLAW_MAX;
+
+    autoMoving = true;
+
+    Serial.println(F("Close Claw"));
+}
+
+// ============================================================
+//                33. 加快速度
+// ============================================================
+
+void increaseSpeed() {
+
+    moveInterval -= 10;
+
+    if (moveInterval < FASTEST) {
+
+        moveInterval = FASTEST;
+    }
+
+    Serial.print(F("Move Interval: "));
+    Serial.println(moveInterval);
+}
+
+// ============================================================
+//                34. 降低速度
+// ============================================================
+
+void decreaseSpeed() {
+
+    moveInterval += 10;
+
+    if (moveInterval > SLOWEST) {
+
+        moveInterval = SLOWEST;
+    }
+
+    Serial.print(F("Move Interval: "));
+    Serial.println(moveInterval);
+}
+
+// ============================================================
+//                35. 多舵机串口控制
+// ============================================================
+
+// 格式：x120,y80,z100
+// x：底座
+// y：大臂
+// z：小臂
+
+// 严格解析三个数字，格式错误时不修改任何目标。
+void multiServoControl(const char *command) {
+    const char *p = command;
+    int values[3];
+    for (byte i = 0; i < 3; ++i) {
+        if (*p++ != "XYZ"[i] || !isdigit((unsigned char)*p)) {
+            Serial.println(F("ERR:FORMAT")); return;
+        }
+        char *end;
+        long angle = strtol(p, &end, 10);
+        if (angle < 0 || angle > 180) { Serial.println(F("ERR:ANGLE")); return; }
+        values[i] = (int)angle;
+        p = end;
+        if (i < 2 && *p++ != ',') { Serial.println(F("ERR:FORMAT")); return; }
+    }
+    if (*p) { Serial.println(F("ERR:FORMAT")); return; }
+    Pose requested = {(uint8_t)values[0], (uint8_t)values[1],
+                      (uint8_t)values[2], (uint8_t)clawAngle};
+    moveToPose(requested);
+    mode = MODE_DIRECT;
+    Serial.println(F("ACK:XYZ"));
+}
+
+// ============================================================
+//                36. 停止所有自动运动
+// ============================================================
+
+void stopAllMovement() {
+    // X/HOME中断录制不发布新数据，也不覆盖旧数据。
+    if (mode == MODE_RECORDING) Serial.println(F("EVT:REC_CANCELLED"));
+    mode = MODE_IDLE;
+
+    cancelTask();
+
+    replaying = false;
+
+    autoMoving = false;
+
+    baseTarget = baseAngle;
+
+    rArmTarget = rArmAngle;
+
+    fArmTarget = fArmAngle;
+
+    clawTarget = clawAngle;
+
+    Serial.println(F("Movement Stopped"));
+}
+
+// ============================================================
+//                37. 串口指令解析
+// ============================================================
+
+// 非阻塞接收一整行
+// 支持9600波特率、换行结尾
+// 与以后任务三按键板的通信格式兼容
+
+
+// ============================================================
+// 连续录制/回放：与R/P/E关键姿态记录使用不同的缓冲区
+// ============================================================
+void syncTargets() {
+    baseTarget = baseAngle;
+    rArmTarget = rArmAngle;
+    fArmTarget = fArmAngle;
+    clawTarget = clawAngle;
+}
+
+MotionFrame currentFrame() {
+    MotionFrame frame = {(uint8_t)baseAngle, (uint8_t)rArmAngle,
+                         (uint8_t)fArmAngle, (uint8_t)clawAngle};
+    return frame;
+}
+
+void appendFrame() {
+    if (recordingCount >= MAX_FRAMES) return;
+    MotionFrame frame = currentFrame();
+    motionBuffers[workBuffer][recordingCount++] = frame;
+    recordingMin.base = min(recordingMin.base, frame.base);
+    recordingMin.rArm = min(recordingMin.rArm, frame.rArm);
+    recordingMin.fArm = min(recordingMin.fArm, frame.fArm);
+    recordingMax.base = max(recordingMax.base, frame.base);
+    recordingMax.rArm = max(recordingMax.rArm, frame.rArm);
+    recordingMax.fArm = max(recordingMax.fArm, frame.fArm);
+}
+
+void startRecording() {
+    syncTargets();
+    workBuffer = 1 - savedBuffer;
+    recordingCount = 0;
+    recordingMin = recordingMax = currentFrame();
+    recordStartedAt = millis();
+    appendFrame();  // t=0第一帧
+    mode = MODE_RECORDING;
+    Serial.println(F("ACK:REC"));
+}
+
+void finishRecording(bool full) {
+    unsigned long duration = millis() - recordStartedAt;
+    if (full) duration = (MAX_FRAMES - 1UL) * RECORD_INTERVAL;
+    // 手动停止时记录最后的部分周期，回放最后一帧用savedDuration定时。
+    unsigned long lastSample = (recordingCount - 1UL) * RECORD_INTERVAL;
+    if (!full && duration > lastSample && recordingCount < MAX_FRAMES) appendFrame();
+    mode = MODE_IDLE;
+    syncTargets();
+    Serial.println(F("ACK:STOP"));
+    if (duration <= MIN_RECORD_MS) {
+        Serial.println(F("ERR:TOO_SHORT")); return;
+    }
+    bool moved = recordingMax.base - recordingMin.base >= MOTION_THRESHOLD ||
+                 recordingMax.rArm - recordingMin.rArm >= MOTION_THRESHOLD ||
+                 recordingMax.fArm - recordingMin.fArm >= MOTION_THRESHOLD;
+    if (!moved) { Serial.println(F("ERR:NO_MOTION")); return; }
+    savedBuffer = workBuffer;
+    savedCount = recordingCount;
+    savedDuration = (uint16_t)duration;
+    savedValid = true;
+    Serial.print(F("SAVED:")); Serial.print(savedCount);
+    Serial.print(','); Serial.println(savedDuration);
+    if (full) Serial.println(F("EVT:RECORD_FULL"));
+}
+
+void updateRecording() {
+    if (mode != MODE_RECORDING) return;
+    // 以开始时刻为基准，避免每帧累积计时误差。
+    while (recordingCount < MAX_FRAMES &&
+           millis() - recordStartedAt >= recordingCount * (unsigned long)RECORD_INTERVAL) {
+        appendFrame();
+    }
+    if (recordingCount == MAX_FRAMES) finishRecording(true);
+}
+
+void startPlayback() {
+    if (!savedValid) { Serial.println(F("ERR:NO_RECORD")); return; }
+    MotionFrame first = motionBuffers[savedBuffer][0];
+    Pose firstPose = {first.base, first.rArm, first.fArm, first.claw};
+    moveToPose(firstPose);  // 先逐度回到录制起点，这段不计入回放时长
+    mode = MODE_PLAY_PREPARE;
+    playbackSettling = false;
+    Serial.println(F("ACK:PLAY"));
+}
+
+void writeFrame(MotionFrame frame) {
+    baseAngle = frame.base; rArmAngle = frame.rArm;
+    fArmAngle = frame.fArm; clawAngle = frame.claw;
+    base.write(baseAngle); rArm.write(rArmAngle);
+    fArm.write(fArmAngle); claw.write(clawAngle);
+    syncTargets();
+    unsigned long now = millis();
+    lastBaseMove = lastRArmMove = lastFArmMove = lastClawMove = now;
+}
+
+void updatePlayback() {
+    if (mode == MODE_PLAY_PREPARE) {
+        if (autoMoving) return;
+        if (!playbackSettling) {
+            playbackSettling = true; playbackSettleAt = millis(); return;
+        }
+        if (millis() - playbackSettleAt < PLAY_PREPARE_WAIT) return;
+        writeFrame(motionBuffers[savedBuffer][0]);
+        playbackIndex = 1;
+        playbackStartedAt = millis();
+        mode = MODE_PLAYBACK;
+        Serial.println(F("EVT:PLAY_STARTED"));
+    }
+    if (mode != MODE_PLAYBACK) return;
+    while (playbackIndex < savedCount) {
+        unsigned long due = playbackIndex == savedCount - 1
+            ? savedDuration : playbackIndex * (unsigned long)RECORD_INTERVAL;
+        if (millis() - playbackStartedAt < due) return;
+        writeFrame(motionBuffers[savedBuffer][playbackIndex++]);
+    }
+    mode = MODE_IDLE;
+    Serial.println(F("DONE:PLAY"));
+}
+
+void printStatus() {
+    Serial.print(F("STATE:"));
+    switch (mode) {
+        case MODE_IDLE: Serial.println(F("IDLE")); break;
+        case MODE_AUTO_TASK: Serial.println(F("AUTO")); break;
+        case MODE_RECORDING: Serial.println(F("RECORDING")); break;
+        case MODE_PLAY_PREPARE: Serial.println(F("PLAY_PREPARE")); break;
+        case MODE_PLAYBACK: Serial.println(F("PLAYBACK")); break;
+        case MODE_HOME: Serial.println(F("HOME")); break;
+        case MODE_POSE_REPLAY: Serial.println(F("POSE_REPLAY")); break;
+        case MODE_DIRECT: Serial.println(F("DIRECT")); break;
+    }
+    Serial.print(F("ANGLES:")); Serial.print(baseAngle); Serial.print(',');
+    Serial.print(rArmAngle); Serial.print(','); Serial.print(fArmAngle);
+    Serial.print(','); Serial.println(clawAngle);
+    Serial.print(F("RECORD:")); Serial.print(savedValid ? savedCount : 0);
+    Serial.print(','); Serial.println(savedValid ? savedDuration : 0);
+}
+
+void processCommand(char *command) {
+    // 高优先级命令先处理，不受普通BUSY限制。
+    if (!strcmp(command, "?")) { printStatus(); return; }
+    if (!strcmp(command, "HOME")) { moveHome(); return; }
+    if (!strcmp(command, "X")) {
+        stopAllMovement(); Serial.println(F("ACK:X")); return;
+    }
+    if (!strcmp(command, "STOP")) {
+        if (mode == MODE_RECORDING) {
+            updateRecording();
+            if (mode == MODE_RECORDING) finishRecording(false);
+        } else {
+            stopAllMovement(); Serial.println(F("ACK:STOP"));
+        }
+        return;
+    }
+    if (!strcmp(command, "H")) { increaseSpeed(); return; }
+    if (!strcmp(command, "L")) { decreaseSpeed(); return; }
+    if (mode != MODE_IDLE) { Serial.println(F("BUSY")); return; }
+
+    if (!strcmp(command, "A") || !strcmp(command, "B") || !strcmp(command, "C")) {
+        startTask(command[0]);
+        Serial.print(F("ACK:")); Serial.println(command[0]);
+    } else if (!strcmp(command, "REC")) startRecording();
+    else if (!strcmp(command, "PLAY")) startPlayback();
+    else if (!strcmp(command, "O") || !strcmp(command, "S")) {
+        syncTargets();
+        if (command[0] == 'O') openClaw(); else closeClaw();
+        mode = MODE_DIRECT;
+        Serial.print(F("ACK:")); Serial.println(command[0]);
+    } else if (!strcmp(command, "R")) recordCurrentPose();
+    else if (!strcmp(command, "P")) showRecordedPoses();
+    else if (!strcmp(command, "E")) startReplay();
+    else if (command[0] == 'X') multiServoControl(command);
+    else Serial.println(F("ERR:COMMAND"));
+}
+
+// 固定字符缓冲区，不使用String或readStringUntil，不等待串口超时。
+void serialControl() {
+    static char buffer[48];
+    static byte length = 0;
+    static bool overflow = false;
+    // 每轮最多处理32字节，持续串口输入不能占死摇杆/录制调度。
+    byte budget = 32;
+    while (budget-- && Serial.available() > 0) {
+        char ch = (char)Serial.read();
+        if (ch == '\r') continue;
+        if (ch == '\n') {
+            if (overflow) Serial.println(F("ERR:COMMAND_TOO_LONG"));
+            else {
+                buffer[length] = '\0';
+                char *begin = buffer;
+                while (*begin && isspace((unsigned char)*begin)) ++begin;
+                char *end = begin + strlen(begin);
+                while (end > begin && isspace((unsigned char)end[-1])) *--end = '\0';
+                for (char *p = begin; *p; ++p) *p = toupper((unsigned char)*p);
+                if (*begin) processCommand(begin);
+            }
+            length = 0; overflow = false;
+            return; // 每轮一条指令，然后及时更新动作
+        }
+        if (overflow) continue;
+        if (length < sizeof(buffer) - 1) buffer[length++] = ch;
+        else overflow = true; // 丢弃本行剩余字符，不能执行截断后的后缀
+    }
+}
+
+void loop() {
+    serialControl();
+    joystickControl();
+    updateAutoMovement();
+    updateReplay();
+    updateTask();
+    updateRecording();
+    updatePlayback();
+    if (!autoMoving && (mode == MODE_HOME || mode == MODE_DIRECT)) {
+        if (mode == MODE_HOME) Serial.println(F("DONE:HOME"));
+        mode = MODE_IDLE;
+    }
+}
