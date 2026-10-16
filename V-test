@@ -1,0 +1,381 @@
+#include <Arduino.h>
+#include <Servo.h>
+#include <EEPROM.h>
+#include <ctype.h>
+#include <math.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct PoseQ;
+struct StoredHeader;
+// Vtest v3.3：摇杆连续示教，最多30秒；E到B90 R90 F90 C120；TRIM5裁剪末5秒。
+// 四轴以0.25度为单位，每100ms用四个有符号半字节记录角度增量。
+// 默认锁夹爪，B/R/F的摇杆轴独立响应，可同时运动；CJ可解锁A3。
+// 录制先存RAM，SAVE显式保存EEPROM。上电读取存档但不启用舵机。
+struct PoseQ { uint16_t q[4]; };
+struct __attribute__((packed)) StoredHeader {
+    uint32_t magic;
+    uint8_t version;
+    uint16_t count;
+    uint16_t interval;
+    uint32_t duration;
+    uint16_t initial[4];
+    uint16_t crc;
+};
+static_assert(sizeof(StoredHeader)==23,"EEPROM header must be23 bytes");
+const uint16_t SAMPLE_MS=100,MAX_DELTAS=300;
+const uint32_t MAX_RECORD_MS=30000UL,STORE_MAGIC=0x31524A56UL;
+const uint8_t STORE_VERSION=1;
+const byte SERVO_PINS[4]={9,8,7,6},JOY_PINS[4]={A0,A1,A2,A3};
+const int8_t JOY_DIR[4]={-1,-1,1,1};
+const uint16_t Q_MIN[4]={0,40,80,200},Q_MAX[4]={720,680,600,520};
+const int DEAD_ZONE=130;
+Servo motors[4];
+PoseQ current={{360,360,360,480}},lastRecorded,moveFrom,moveTo,playFrom,playNext;
+int lastPulse[4]={-1,-1,-1,-1};
+int joyCenter[4]={511,517,526,523};
+unsigned long lastJoyStep[4]={0,0,0,0};
+uint16_t joyFullInterval=40;
+uint8_t deltas[MAX_DELTAS][2];
+StoredHeader record={};
+bool enabled=false,joyEnabled=false,clawLocked=true,recordValid=false,paused=false;
+bool enableJoyAfterMove=false;
+enum Mode : uint8_t { IDLE,RECORDING,MOVING,PLAYING,SAVING };
+Mode mode=IDLE;
+unsigned long recordStart=0,lastProgress=0,motionStart=0,motionDuration=0;
+unsigned long lastControl=0,pauseStart=0,pauseTotal=0;
+uint16_t playIndex=0,saveOffset=0,saveLimit=0;
+uint8_t saveStage=0;
+int8_t commitIndex=3;
+char input[48];byte inputUsed=0;bool inputOverflow=false;
+
+bool legalPose(const PoseQ &p){
+    for(byte i=0;i<4;++i)if(p.q[i]<Q_MIN[i]||p.q[i]>Q_MAX[i])return false;
+    return true;
+}
+uint16_t poseDelta(const PoseQ &a,const PoseQ &b){
+    uint16_t d=0;for(byte i=0;i<4;++i)d=max(d,(uint16_t)abs((int)a.q[i]-(int)b.q[i]));return d;
+}
+void outputPose(){
+    if(!enabled)return;
+    for(byte i=0;i<4;++i){
+        int us=544+(int)(((unsigned long)current.q[i]*1856UL+360UL)/720UL);
+        if(us!=lastPulse[i]){motors[i].writeMicroseconds(us);lastPulse[i]=us;}
+    }
+}
+void resetJoyClock(){unsigned long now=millis();for(byte i=0;i<4;++i)lastJoyStep[i]=now;}
+void printAngles(const PoseQ &p){
+    const char names[4]={'B','R','F','C'};
+    for(byte i=0;i<4;++i){if(i)Serial.print(' ');Serial.print(names[i]);Serial.print('=');Serial.print(p.q[i]/4.0f,2);}
+    Serial.println();
+}
+void printStatus(){
+    Serial.print(F("STATE:"));
+    if(mode==RECORDING)Serial.println(F("RECORDING"));
+    else if(mode==MOVING)Serial.println(paused?F("RETURN_PAUSED"):F("MOVING"));
+    else if(mode==PLAYING)Serial.println(paused?F("PLAY_PAUSED"):F("PLAYING"));
+    else if(mode==SAVING)Serial.println(F("SAVING"));else Serial.println(F("IDLE"));
+    printAngles(current);
+    Serial.print(F("JOY:"));Serial.print(joyEnabled);Serial.print(F(" CLAW_LOCK:"));Serial.println(clawLocked);
+    Serial.print(F("RAM:"));Serial.print(recordValid);Serial.print(F(" samples="));Serial.print(recordValid?record.count+1:0);
+    Serial.print(F(" ms="));Serial.println(recordValid?record.duration:0);
+}
+uint16_t crcByte(uint16_t crc,uint8_t value){
+    crc^=value;for(byte i=0;i<8;++i)crc=(crc&1)?(crc>>1)^0xA001:crc>>1;return crc;
+}
+uint16_t headerCRC(const StoredHeader &h){
+    const uint8_t *p=(const uint8_t*)&h;uint16_t crc=0xFFFF;
+    for(byte i=4;i<offsetof(StoredHeader,crc);++i)crc=crcByte(crc,p[i]);return crc;
+}
+bool decodeStep(PoseQ &p,uint8_t a,uint8_t b){
+    PoseQ next=p;
+    for(byte i=0;i<4;++i){
+        uint8_t nibble=((i<2?a:b)>>(4*(i&1)))&15;
+        if(nibble==8)return false;
+        int delta=nibble>=8?(int)nibble-16:nibble;
+        int value=(int)p.q[i]+delta;
+        if(value<(int)Q_MIN[i]||value>(int)Q_MAX[i])return false;
+        next.q[i]=(uint16_t)value;
+    }
+    p=next;return true;
+}
+bool loadEEPROM(){
+    StoredHeader h;EEPROM.get(0,h);
+    if(h.magic!=STORE_MAGIC||h.version!=STORE_VERSION||h.interval!=SAMPLE_MS||h.count==0||h.count>MAX_DELTAS)return false;
+    if(sizeof(h)+2UL*h.count>EEPROM.length()||h.duration==0||h.duration>MAX_RECORD_MS)return false;
+    if(h.duration<=(h.count-1UL)*SAMPLE_MS||h.duration>h.count*(unsigned long)SAMPLE_MS)return false;
+    PoseQ p;memcpy(p.q,h.initial,sizeof(p.q));if(!legalPose(p))return false;
+    uint16_t crc=headerCRC(h);
+    for(uint16_t i=0;i<h.count;++i){
+        uint8_t a=EEPROM.read(sizeof(h)+2*i),b=EEPROM.read(sizeof(h)+2*i+1);
+        crc=crcByte(crc,a);crc=crcByte(crc,b);if(!decodeStep(p,a,b))return false;
+    }
+    if(crc!=h.crc)return false;
+    for(uint16_t i=0;i<h.count;++i){deltas[i][0]=EEPROM.read(sizeof(h)+2*i);deltas[i][1]=EEPROM.read(sizeof(h)+2*i+1);}
+    record=h;recordValid=true;return true;
+}
+void stopHold(){
+    if(mode==RECORDING){recordValid=false;Serial.println(F("RECORD_ABORTED; EEPROM unchanged"));}
+    if(mode==SAVING)Serial.println(F("SAVE_ABORTED; incomplete EEPROM is rejected on load"));
+    mode=IDLE;paused=false;joyEnabled=false;enableJoyAfterMove=false;resetJoyClock();Serial.println(F("STOP: holding"));
+}
+bool appendSample(){
+    if(record.count>=MAX_DELTAS)return false;
+    uint8_t packed[2]={0,0};
+    for(byte i=0;i<4;++i){
+        int delta=(int)current.q[i]-(int)lastRecorded.q[i];
+        if(delta < -7||delta > 7){stopHold();Serial.println(F("ERR:RECORD_STEP; use slower joystick speed"));return false;}
+        packed[i/2]|=((uint8_t)delta&15)<<(4*(i&1));
+    }
+    deltas[record.count][0]=packed[0];deltas[record.count][1]=packed[1];++record.count;
+    lastRecorded=current;return true;
+}
+void recordingReady(unsigned long duration){
+    record.duration=duration;recordValid=record.count>0&&duration>0;
+    mode=IDLE;joyEnabled=false;resetJoyClock();
+    if(!recordValid){Serial.println(F("ERR:EMPTY_RECORD"));return;}
+    Serial.print(F("READY_RAM samples="));Serial.print(record.count+1);Serial.print(F(" ms="));Serial.println(record.duration);
+    Serial.println(F("SAVE: keep after power-off; H0: return start; V: replay"));
+}
+void updateRecording(){
+    if(mode!=RECORDING)return;
+    unsigned long elapsed=millis()-recordStart;
+    while(record.count<MAX_DELTAS&&elapsed>=(record.count+1UL)*SAMPLE_MS){if(!appendSample())return;}
+    if(record.count==MAX_DELTAS){recordingReady(MAX_RECORD_MS);Serial.println(F("RECORD_FULL:30s"));return;}
+    if(millis()-lastProgress>=2000){lastProgress=millis();Serial.print(F("REC seconds="));Serial.println(elapsed/1000);}
+}
+void beginRecord(){
+    if(!enabled){Serial.println(F("ERR:E_FIRST"));return;}
+    if(mode!=IDLE){Serial.println(F("BUSY"));return;}
+    memset(&record,0,sizeof(record));record.magic=STORE_MAGIC;record.version=STORE_VERSION;record.interval=SAMPLE_MS;
+    memcpy(record.initial,current.q,sizeof(record.initial));lastRecorded=current;recordValid=false;
+    recordStart=lastProgress=millis();joyEnabled=true;resetJoyClock();mode=RECORDING;
+    Serial.println(F("RECORDING: max30s; draw with joystick; STOP ends early"));
+}
+void endRecord(){
+    updateRecording();if(mode!=RECORDING)return;
+    unsigned long elapsed=min(millis()-recordStart,MAX_RECORD_MS);
+    if(elapsed>record.count*(unsigned long)SAMPLE_MS&&!appendSample())return;
+    recordingReady(elapsed);
+}
+void trimTail(unsigned long removeMs){
+    if(!recordValid){Serial.println(F("ERR:NO_RECORD"));return;}
+    if(removeMs==0||removeMs>=record.duration){Serial.println(F("ERR:TRIM_TOO_LONG"));return;}
+    unsigned long cut=record.duration-removeMs;
+    uint16_t count=(uint16_t)((cut+SAMPLE_MS-1)/SAMPLE_MS);
+    // 如果裁剪点不在整100ms上，保留该时刻的插值角度，而非下一帧角度。
+    if(cut%SAMPLE_MS){
+        PoseQ before;memcpy(before.q,record.initial,sizeof(before.q));
+        for(uint16_t i=0;i<count-1;++i){
+            if(!decodeStep(before,deltas[i][0],deltas[i][1])){Serial.println(F("ERR:BAD_RECORD"));return;}
+        }
+        PoseQ after=before;
+        if(!decodeStep(after,deltas[count-1][0],deltas[count-1][1])){Serial.println(F("ERR:BAD_RECORD"));return;}
+        unsigned long t0=(count-1UL)*SAMPLE_MS,t1=frameTime(count);
+        float u=(cut-t0)/(float)(t1-t0);uint8_t packed[2]={0,0};
+        for(byte i=0;i<4;++i){
+            int value=(int)lroundf(before.q[i]+((int)after.q[i]-(int)before.q[i])*u);
+            int delta=value-(int)before.q[i];
+            if(delta < -7||delta > 7){Serial.println(F("ERR:TRIM_STEP"));return;}
+            packed[i/2]|=((uint8_t)delta&15)<<(4*(i&1));
+        }
+        deltas[count-1][0]=packed[0];deltas[count-1][1]=packed[1];
+    }
+    record.count=count;record.duration=cut;record.crc=0;joyEnabled=false;
+    Serial.print(F("TRIMMED ms="));Serial.print(record.duration);
+    Serial.print(F(" samples="));Serial.print(record.count+1);
+    Serial.print(F(" removed_ms="));Serial.println(removeMs);
+    Serial.println(F("RAM trimmed; SAVE to keep in EEPROM"));
+}
+void beginSave(){
+    if(mode!=IDLE){Serial.println(F("BUSY"));return;}
+    if(!recordValid){Serial.println(F("ERR:NO_RECORD"));return;}
+    joyEnabled=false;record.crc=headerCRC(record);
+    for(uint16_t i=0;i<record.count;++i){record.crc=crcByte(record.crc,deltas[i][0]);record.crc=crcByte(record.crc,deltas[i][1]);}
+    if(sizeof(record)+2UL*record.count>EEPROM.length()){Serial.println(F("ERR:EEPROM_SIZE"));return;}
+    saveStage=0;saveOffset=4;saveLimit=sizeof(record)+2*record.count;commitIndex=3;mode=SAVING;
+    Serial.println(F("SAVING: hold pose until SAVED_EEPROM"));
+}
+void updateSave(){
+    if(mode!=SAVING)return;
+    const uint8_t *header=(const uint8_t*)&record;
+    if(saveStage==0){EEPROM.update(0,0);saveStage=1;return;}
+    if(saveStage==1){
+        uint16_t address=saveOffset++;
+        uint8_t value=address<sizeof(record)?header[address]:deltas[(address-sizeof(record))/2][(address-sizeof(record))&1];
+        EEPROM.update(address,value);if(saveOffset>=saveLimit)saveStage=2;return;
+    }
+    // 最后才提交magic，避免把断电中途的半份数据识别为有效存档。
+    EEPROM.update(commitIndex,header[commitIndex]);
+    if(commitIndex--==0){mode=IDLE;Serial.println(loadEEPROM()?F("SAVED_EEPROM"):F("ERR:SAVE_VERIFY"));}
+}
+void beginMove(PoseQ target){
+    enableJoyAfterMove=false;
+    moveFrom=current;moveTo=target;motionDuration=max(400UL,poseDelta(current,target)*40UL);
+    motionStart=lastControl=millis();pauseTotal=0;paused=false;joyEnabled=false;mode=MOVING;
+    Serial.println(F("MOVING: wait DONE"));
+}
+unsigned long frameTime(uint16_t index){return index==record.count?record.duration:index*(unsigned long)SAMPLE_MS;}
+void beginPlay(){
+    if(!enabled){Serial.println(F("ERR:E_FIRST"));return;}
+    if(mode!=IDLE){Serial.println(F("BUSY"));return;}
+    if(!recordValid){Serial.println(F("ERR:NO_RECORD"));return;}
+    memcpy(playFrom.q,record.initial,sizeof(playFrom.q));
+    if(poseDelta(current,playFrom)>1){Serial.println(F("ERR:GO_H0_FIRST; return with paper clear"));return;}
+    current=playFrom;playNext=playFrom;
+    if(!decodeStep(playNext,deltas[0][0],deltas[0][1])){Serial.println(F("ERR:BAD_RECORD"));return;}
+    joyEnabled=false;paused=false;pauseTotal=0;playIndex=0;motionStart=lastControl=millis();mode=PLAYING;outputPose();
+    Serial.println(F("PLAYING: original timing; joystick ignored"));
+}
+void updateMotion(){
+    if((mode!=MOVING&&mode!=PLAYING)||paused)return;
+    unsigned long now=millis();if(now-lastControl<20)return;lastControl=now;
+    unsigned long elapsed=now-motionStart-pauseTotal;
+    if(mode==MOVING){
+        float u=min(1.0f,elapsed/(float)motionDuration),s=u*u*(3-2*u);
+        for(byte i=0;i<4;++i)current.q[i]=(uint16_t)lroundf(moveFrom.q[i]+((int)moveTo.q[i]-(int)moveFrom.q[i])*s);
+        outputPose();if(u>=1){
+            current=moveTo;outputPose();mode=IDLE;
+            if(enableJoyAfterMove){enableJoyAfterMove=false;joyEnabled=true;resetJoyClock();Serial.println(F("DONE:E_HOME; joystick ON"));}
+            else Serial.println(F("DONE:POSITION"));
+        }return;
+    }
+    while(elapsed>=frameTime(playIndex+1)){
+        current=playNext;playFrom=playNext;++playIndex;
+        if(playIndex==record.count){outputPose();mode=IDLE;Serial.println(F("DONE:V_REPLAY"));return;}
+        playNext=playFrom;
+        if(!decodeStep(playNext,deltas[playIndex][0],deltas[playIndex][1])){stopHold();Serial.println(F("ERR:BAD_RECORD"));return;}
+    }
+    unsigned long t0=playIndex*(unsigned long)SAMPLE_MS,t1=frameTime(playIndex+1);
+    float u=(elapsed-t0)/(float)(t1-t0);
+    for(byte i=0;i<4;++i)current.q[i]=(uint16_t)lroundf(playFrom.q[i]+((int)playNext.q[i]-(int)playFrom.q[i])*u);
+    outputPose();
+}
+void updateJoystick(){
+    if(!enabled||!joyEnabled||(mode!=IDLE&&mode!=RECORDING))return;
+    unsigned long now=millis();bool changed=false;
+    for(byte i=0;i<4;++i){
+        if(i==3&&clawLocked)continue;
+        int value=analogRead(JOY_PINS[i]),offset=value-joyCenter[i],strength=abs(offset);
+        if(strength<=DEAD_ZONE){lastJoyStep[i]=now;continue;}
+        int span=offset>0?1023-joyCenter[i]:joyCenter[i];
+        uint16_t fastest=i==3?max((uint16_t)80,joyFullInterval):joyFullInterval;
+        uint16_t interval=(uint16_t)map(constrain(strength,DEAD_ZONE+1,span),DEAD_ZONE+1,span,130,fastest);
+        if(now-lastJoyStep[i]<interval)continue;lastJoyStep[i]=now;
+        int step=(offset>0?1:-1)*JOY_DIR[i];
+        uint16_t next=(uint16_t)constrain((int)current.q[i]+step,(int)Q_MIN[i],(int)Q_MAX[i]);
+        if(next!=current.q[i]){current.q[i]=next;changed=true;}
+    }
+    if(changed)outputPose();
+}
+void calibrateJoystick(){
+    joyEnabled=false;uint16_t sums[4]={0,0,0,0};
+    for(byte n=0;n<32;++n)for(byte i=0;i<4;++i)sums[i]+=analogRead(JOY_PINS[i]);
+    for(byte i=0;i<4;++i)if(sums[i]/32<250||sums[i]/32>750){Serial.println(F("ERR:CAL; release sticks then CAL"));return;}
+    Serial.print(F("CENTERS:"));for(byte i=0;i<4;++i){joyCenter[i]=sums[i]/32;if(i)Serial.print(',');Serial.print(joyCenter[i]);}
+    Serial.println();Serial.println(F("CAL done; JOY or REC to enable joystick"));
+}
+void dumpRecord(){
+    if(!recordValid){Serial.println(F("ERR:NO_RECORD"));return;}joyEnabled=false;
+    PoseQ p;memcpy(p.q,record.initial,sizeof(p.q));Serial.println(F("index,time_ms,B,R,F,C"));
+    for(uint16_t n=0;n<=record.count;++n){
+        if(n&&!decodeStep(p,deltas[n-1][0],deltas[n-1][1])){Serial.println(F("ERR:BAD_RECORD"));return;}
+        Serial.print(n);Serial.print(',');Serial.print(n?frameTime(n):0);
+        for(byte i=0;i<4;++i){Serial.print(',');Serial.print(p.q[i]/4.0f,2);}Serial.println();
+    }
+    Serial.println(F("DUMP_DONE"));
+}
+void help(){
+    Serial.println(F("MeArm V Test v3.3 JOYSTICK RECORD 30s |9600 Newline"));
+    Serial.println(F("E: B90 R90 F90 C120, then joystick ON; claw locked."));
+    Serial.println(F("REC/R: record <=30s; STOP: finish; SAVE: keep in EEPROM."));
+    Serial.println(F("TRIM5: remove last5 seconds from RAM recording; SAVE to keep."));
+    Serial.println(F("H0/G: slow return to recorded start; move paper clear first."));
+    Serial.println(F("V/PLAY: replay at original timing, requires start pose."));
+    Serial.println(F("JOY: joystick ON; K: hold; CJ/CL: unlock/lock claw A3."));
+    Serial.println(F("B90 R120 F70 C122: absolute joint angle, one command per line."));
+    Serial.println(F("C+/C-: claw +/-1deg; H/L: joystick faster/slower."));
+    Serial.println(F("P: playback/return pause; X: stop/hold; D: detach."));
+    Serial.println(F("?: status; CAL: released-stick center; J: ADC; DUMP:CSV; LOAD:EEPROM."));
+    Serial.println(F("Pins B9 R8 F7 C6; A0-B reverse,A1-R reverse,A2-F+,A3-C+."));
+    Serial.println(F("100ms samples,0.25deg; commands recorded, not measured pen positions."));
+}
+void command(char *s){
+    while(*s==' '||*s=='\t')++s;size_t length=strlen(s);
+    while(length&&(s[length-1]==' '||s[length-1]=='\t'))s[--length]=0;
+    for(char *p=s;*p;++p)*p=toupper((unsigned char)*p);if(!*s)return;
+    if(!strcmp(s,"X")){stopHold();return;}
+    if(!strcmp(s,"D")){stopHold();for(byte i=0;i<4;++i)motors[i].detach();enabled=false;Serial.println(F("DETACHED"));return;}
+    if(!strcmp(s,"STOP")){if(mode==RECORDING)endRecord();else stopHold();return;}
+    if(!strcmp(s,"?")||!strcmp(s,"T")||!strcmp(s,"STATUS")){printStatus();return;}
+    if(!strcmp(s,"P")){
+        if(mode!=MOVING&&mode!=PLAYING){Serial.println(F("ERR:NOT_PLAYING"));return;}
+        if(!paused){paused=true;pauseStart=millis();}else{pauseTotal+=millis()-pauseStart;paused=false;lastControl=millis();}
+        Serial.println(paused?F("PAUSED"):F("RESUMED"));return;
+    }
+    if(!strcmp(s,"H")||!strcmp(s,"L")){
+        joyFullInterval=constrain((int)joyFullInterval+(!strcmp(s,"H")?-5:5),25,125);
+        Serial.print(F("JOY full-stick step_ms="));Serial.println(joyFullInterval);return;
+    }
+    if(!strcmp(s,"K")){joyEnabled=false;Serial.println(F("JOY OFF"));return;}
+    if(!strcmp(s,"JOY")&&(mode==IDLE||mode==RECORDING)){
+        if(!enabled){Serial.println(F("ERR:E_FIRST"));return;}joyEnabled=true;resetJoyClock();Serial.println(F("JOY ON"));return;
+    }
+    if(!strcmp(s,"CJ")||!strcmp(s,"CL")){
+        if(mode!=IDLE&&mode!=RECORDING){Serial.println(F("BUSY"));return;}
+        clawLocked=!strcmp(s,"CL");Serial.println(clawLocked?F("CLAW LOCKED"):F("CLAW JOYSTICK ON"));return;
+    }
+    if(mode!=IDLE){Serial.println(F("BUSY; STOP or X first"));return;}
+    if(!strcmp(s,"HELP")){help();return;}
+    if(!strcmp(s,"E")){
+        if(!enabled){for(byte i=0;i<4;++i){motors[i].attach(SERVO_PINS[i]);lastPulse[i]=-1;}enabled=true;outputPose();}
+        clawLocked=true;PoseQ homePose={{360,360,360,480}};
+        if(poseDelta(current,homePose)>0){
+            beginMove(homePose);enableJoyAfterMove=true;Serial.println(F("E: moving to B90 R90 F90 C120; wait DONE:E_HOME"));
+        }else{
+            joyEnabled=true;resetJoyClock();Serial.println(F("ENABLED V3.3; B90 R90 F90 C120; joystick ON"));printAngles(current);
+        }
+        return;
+    }
+    if(!strcmp(s,"REC")||!strcmp(s,"R")){beginRecord();return;}
+    if(!strcmp(s,"SAVE")){beginSave();return;}
+    if(!strncmp(s,"TRIM",4)){
+        char *end;unsigned long seconds=strtoul(s+4,&end,10);
+        if(!isdigit((unsigned char)s[4])||*end||seconds<1||seconds>29){Serial.println(F("ERR:TRIM1..29"));return;}
+        trimTail(seconds*1000UL);return;
+    }
+    if(!strcmp(s,"LOAD")){joyEnabled=false;Serial.println(loadEEPROM()?F("LOADED_EEPROM"):F("ERR:NO_VALID_EEPROM"));return;}
+    if(!strcmp(s,"V")||!strcmp(s,"PLAY")){beginPlay();return;}
+    if(!strcmp(s,"H0")||!strcmp(s,"G")){
+        if(!enabled){Serial.println(F("ERR:E_FIRST"));return;}
+        if(!recordValid){Serial.println(F("ERR:NO_RECORD"));return;}
+        PoseQ target;memcpy(target.q,record.initial,sizeof(target.q));beginMove(target);return;
+    }
+    if(!strcmp(s,"CAL")){calibrateJoystick();return;}
+    if(!strcmp(s,"DUMP")){dumpRecord();return;}
+    if(!strcmp(s,"J")){for(byte i=0;i<4;++i){if(i)Serial.print(',');Serial.print(analogRead(JOY_PINS[i]));}Serial.println();return;}
+    byte axis=4;for(byte i=0;i<4;++i)if(s[0]=="BRFC"[i])axis=i;
+    if(axis<4&&s[1]){
+        if(!enabled){Serial.println(F("ERR:E_FIRST"));return;}
+        char *end;float angle;
+        if(axis==3&&(!strcmp(s,"C+")||!strcmp(s,"C-")))angle=current.q[3]/4.0f+(s[1]=='+'?1:-1);
+        else{angle=strtod(s+1,&end);if(end==s+1||*end||!isfinite(angle)){Serial.println(F("ERR:ANGLE"));return;}}
+        if(angle<Q_MIN[axis]/4.0f||angle>Q_MAX[axis]/4.0f){Serial.println(F("ERR:JOINT_LIMIT"));return;}
+        PoseQ target=current;target.q[axis]=(uint16_t)lroundf(angle*4);if(axis==3)clawLocked=true;beginMove(target);return;
+    }
+    Serial.println(F("ERR:COMMAND; HELP"));
+}
+void readSerial(){
+    byte readCount=0;while(Serial.available()&&readCount++<32){
+        char c=Serial.read();if(c=='\n'||c=='\r'){
+            if(inputOverflow)Serial.println(F("ERR:LINE_TOO_LONG"));else if(inputUsed){input[inputUsed]=0;command(input);}
+            inputUsed=0;inputOverflow=false;
+        }else if(!inputOverflow){if(inputUsed<sizeof(input)-1)input[inputUsed++]=c;else inputOverflow=true;}
+    }
+}
+void setup(){
+    Serial.begin(9600);help();
+    Serial.println(loadEEPROM()?F("EEPROM record restored; E to enable"):F("No saved record; E then REC to teach"));
+}
+void loop(){readSerial();updateJoystick();updateRecording();updateMotion();updateSave();}
